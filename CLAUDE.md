@@ -30,5 +30,5 @@ Business listing monitor — scrapes BusinessBroker.net (not BizBuySell, which b
 
 ## Google Sheet
 
-- ID: `1l_p6xITLq-CD3HHeclTEyYAM1VNDnNXeFsxQqJliGn0`
+- ID: see `.env` file (`GOOGLE_SHEET_ID`)
 - Columns: Date Found, State, City, Business Name, Asking Price, SDE, SDE Flag, URL, Industry

@@ -73,7 +73,7 @@ crontab -e
 Add this line (adjust the path to match your setup):
 
 ```
-0 8-18 * * * /Users/jesse/Documents/Projects/bizbuysell-monitor/run_monitor.sh
+0 8-18 * * * /path/to/bizbuysell-monitor/run_monitor.sh
 ```
 
 This assumes your Mac is set to Mountain time. To verify:

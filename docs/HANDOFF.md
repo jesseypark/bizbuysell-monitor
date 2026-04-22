@@ -26,5 +26,5 @@
 ## Environment notes
 
 - macOS (Apple Silicon) with Python 3.9.6 (system)
-- Google Cloud project: `ontimeapp-489221` with service account credentials on disk
-- Google Sheet ID: `1l_p6xITLq-CD3HHeclTEyYAM1VNDnNXeFsxQqJliGn0`
+- Google Cloud project with service account credentials on disk (see `.env`)
+- Google Sheet ID in `.env` (`GOOGLE_SHEET_ID`)
