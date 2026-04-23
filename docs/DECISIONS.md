@@ -8,17 +8,20 @@ BizBuySell uses Akamai Bot Manager which blocks all automated access — request
 
 `curl_cffi` impersonates Chrome's TLS fingerprint, which is enough for BusinessBroker.net (no JS challenge). Much lighter than Playwright (no browser binary), and works on all architectures including Apple Silicon. Falls back gracefully on HTTP errors.
 
-## Search results cards for most data, detail pages only for industry
+## Search results cards only (no detail page visits)
 
-BusinessBroker.net search result cards contain name, asking price, cash flow, and location — enough to filter. Only the industry/category field requires visiting the detail page. The script only visits detail pages for new listings that pass the SDE filter, minimizing requests.
+BusinessBroker.net search result cards contain name, asking price, cash flow, and location — everything needed to filter. Industry is classified from the business name using keyword matching rather than scraping the detail page. This eliminated per-listing detail page fetches, making runs much faster.
+
+## Keyword-based industry classification
+
+Industry is derived from the business name using a canonical keyword map (`INDUSTRY_KEYWORDS`) rather than scraping it from the listing detail page. A persistent `industries.json` cache ensures consistency across runs. Keywords are grouped to avoid duplicates (e.g., "sewer", "drain", "plumber" all map to "Plumbing"). Unmatched names get "Other".
 
 ## SDE filtering logic
 
 - SDE >= $300k → included
 - SDE < $300k → skipped entirely
-- No SDE/cash flow listed → included with "NO SDE LISTED" flag (user wants to review these manually)
-
-Intentionally permissive on missing data — better to surface a listing without SDE than miss a good one.
+- No SDE/cash flow listed, asking price >= $1M → included
+- No SDE/cash flow listed, asking price < $1M → skipped
 
 ## Single-file architecture
 

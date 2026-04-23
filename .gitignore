@@ -6,5 +6,6 @@ __pycache__/
 credentials.json
 ontimeapp-*.json
 seen_listings.json
+industries.json
 monitor.log
 debug_html/

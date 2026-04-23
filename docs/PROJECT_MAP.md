@@ -16,12 +16,17 @@ monitor.py          Main script — single-file, runs end-to-end
     ├── Scraping layer (BeautifulSoup)
     │   ├── extract_listings_from_search() → parses search results cards
     │   ├── _parse_card()                  → extracts name/price/CF/location from one card
-    │   ├── get_max_page()                 → reads pagination to find last page
-    │   └── extract_industry()             → parses detail page for industry
+    │   └── get_max_page()                 → reads pagination to find last page
+    │
+    ├── Industry classification
+    │   ├── classify_industry()    → keyword-based classification from business name
+    │   ├── INDUSTRY_KEYWORDS      → canonical industry → keyword list mapping
+    │   ├── load_industries() / save_industries() → persistent cache
+    │   └── industries.json        → cached name→industry mappings (auto-created)
     │
     ├── Filtering layer
     │   ├── parse_dollar_amount() → normalizes "$500K" / "$1.5M" / "$300,000" → int
-    │   └── evaluate_listing()    → include/skip/flag based on SDE threshold
+    │   └── evaluate_listing()    → include/skip based on SDE or asking price
     │
     ├── Persistence layer
     │   ├── load_seen() / save_seen() → JSON file tracking seen listing URLs
@@ -42,6 +47,7 @@ monitor.py          Main script — single-file, runs end-to-end
 | `requirements.txt` | Python deps: beautifulsoup4, curl_cffi, gspread, google-auth, dotenv |
 | `.env` | Runtime config: credentials path + sheet ID |
 | `seen_listings.json` | Tracks URLs already processed (auto-created at runtime) |
+| `industries.json` | Cached business name → industry mappings (auto-created) |
 | `monitor.log` | Append-only log with timestamps, counts, errors |
 | `ontimeapp-*.json` | Google Cloud service account credentials (gitignored) |
 
@@ -51,8 +57,8 @@ monitor.py          Main script — single-file, runs end-to-end
 2. For each state (CO, WA): paginate through all search results pages
 3. Parse listing cards directly from search results HTML (name, price, cash flow, location, URL)
 4. Compare URLs against `seen_listings.json` → skip already-seen
-5. Filter: SDE >= $300k → include; SDE < $300k → skip; no SDE → flag "NO SDE LISTED"
-6. For new matching listings only: visit detail page → extract industry via `div.industry`
+5. Filter: SDE >= $300k → include; SDE < $300k → skip; no SDE but asking >= $1M → include
+6. Classify industry from business name using keyword matching (no detail page fetch needed)
 7. Append matching listings as rows to Google Sheet
 8. If a state returns zero listings (and previously had results) → append warning row
 9. Save updated seen URLs to JSON
@@ -69,10 +75,6 @@ Search results page:
 - Pagination: `ul.searchPaging` → `a` tags with page numbers
 - URL pattern: `?page=N`
 
-Detail page:
-- Industry: `div.industry`
-- Fallback: breadcrumbs second-to-last `li`
-
 ## Scheduling
 
-Cron: `0 8-18 * * *` → hourly 8am-6pm Mountain time
+Cron: `0 8-18 * * 1-5` → hourly 8am-6pm Mountain time, weekdays only

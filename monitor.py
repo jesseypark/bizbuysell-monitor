@@ -50,6 +50,8 @@ logger = logging.getLogger("listing_monitor")
 
 
 def setup_logging():
+    if logger.handlers:
+        return
     logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -239,44 +241,101 @@ def get_max_page(html):
     return max(pages) if pages else 1
 
 
-# --- Detail page parsing (for industry) ---
+# --- Industry classification ---
+
+INDUSTRY_FILE = SCRIPT_DIR / "industries.json"
+
+INDUSTRY_KEYWORDS = {
+    "Plumbing": ["plumbing", "plumber", "drain", "sewer", "septic", "pipe"],
+    "HVAC": ["hvac", "heating", "cooling", "air conditioning", "furnace"],
+    "Electrical": ["electrical", "electrician", "wiring"],
+    "Roofing": ["roofing", "roofer", "roof"],
+    "Landscaping": ["landscaping", "lawn", "irrigation", "tree service", "tree care", "arborist"],
+    "Construction": ["construction", "building", "contractor", "excavation", "demolition", "concrete", "paving", "asphalt"],
+    "Painting": ["painting", "painter", "coatings"],
+    "Pest Control": ["pest control", "exterminator", "termite"],
+    "Cleaning Services": ["cleaning", "janitorial", "maid", "carpet cleaning", "pressure washing"],
+    "Auto Repair": ["auto repair", "mechanic", "automotive", "auto body", "collision", "tire"],
+    "Auto Dealership": ["auto dealer", "car dealer", "dealership", "used car"],
+    "Restaurant": ["restaurant", "dining", "eatery", "bistro", "cafe", "diner", "pizza", "burger", "taco", "sushi", "bbq", "barbecue", "steakhouse", "grill"],
+    "Fast Food / QSR": ["fast food", "franchise food", "drive-thru", "drive through"],
+    "Bar / Brewery": ["bar", "brewery", "brewpub", "pub", "tavern", "taproom", "winery", "distillery"],
+    "Coffee Shop": ["coffee", "espresso"],
+    "Bakery": ["bakery", "donut", "doughnut", "pastry"],
+    "Catering": ["catering", "caterer"],
+    "Food Manufacturing": ["food manufacturing", "food production", "food processing", "meat processing", "bottling"],
+    "Gas Station / C-Store": ["gas station", "fuel", "convenience store", "c-store"],
+    "Retail": ["retail", "store", "shop", "boutique", "gift shop"],
+    "E-Commerce": ["e-commerce", "ecommerce", "online store", "amazon", "shopify"],
+    "Grocery": ["grocery", "supermarket", "market"],
+    "Franchise": ["franchise"],
+    "Hotel / Motel": ["hotel", "motel", "inn", "lodge", "resort", "hospitality"],
+    "Fitness / Gym": ["fitness", "gym", "crossfit", "yoga", "pilates", "martial arts"],
+    "Salon / Spa": ["salon", "spa", "barber", "hair", "beauty", "nail"],
+    "Daycare / Childcare": ["daycare", "childcare", "child care", "preschool", "montessori"],
+    "Senior Care": ["senior care", "assisted living", "elder care", "home health", "home care"],
+    "Medical Practice": ["medical", "dental", "dentist", "physician", "clinic", "chiropractic", "optometry", "veterinary", "vet clinic", "orthodontic", "dermatology", "urgent care"],
+    "Pharmacy": ["pharmacy", "pharmacist", "compounding"],
+    "Staffing": ["staffing", "recruiting", "employment agency", "temp agency"],
+    "IT / Technology": ["it services", "software", "saas", "technology", "tech", "cyber", "data center", "managed services", "msp", "web development", "app development"],
+    "Marketing / Advertising": ["marketing", "advertising", "digital marketing", "seo", "media", "pr agency", "branding"],
+    "Accounting / Finance": ["accounting", "bookkeeping", "tax", "cpa", "financial", "wealth management", "insurance agency"],
+    "Legal": ["law firm", "legal", "attorney"],
+    "Real Estate": ["real estate", "property management", "brokerage"],
+    "Manufacturing": ["manufacturing", "fabrication", "machining", "machine shop", "welding", "cnc", "metal"],
+    "Distribution / Wholesale": ["distribution", "wholesale", "distributor", "supply chain"],
+    "Logistics / Trucking": ["logistics", "trucking", "freight", "shipping", "courier", "delivery", "moving company", "storage"],
+    "Agriculture": ["farm", "ranch", "agriculture", "nursery", "greenhouse"],
+    "Printing": ["printing", "print shop", "signage", "sign company"],
+    "Pet Services": ["pet", "dog", "grooming", "kennel", "pet store", "veterinary"],
+    "Education / Tutoring": ["tutoring", "education", "training", "school", "academy"],
+    "Entertainment": ["entertainment", "amusement", "arcade", "bowling", "event", "party rental"],
+    "Travel / Tourism": ["travel", "tour", "tourism"],
+    "Waste Management": ["waste", "recycling", "junk removal", "dumpster", "trash", "disposal"],
+}
 
 
-def extract_industry(html):
-    soup = BeautifulSoup(html, "html.parser")
+def load_industries():
+    if INDUSTRY_FILE.exists():
+        with open(INDUSTRY_FILE) as f:
+            return json.load(f)
+    return {}
 
-    ind_el = soup.find(class_="industry")
-    if ind_el:
-        text = ind_el.get_text(strip=True)
-        if text:
-            return text
 
-    # Fallback: breadcrumbs
-    for sel in ["ul.breadcrumbs", "ol.breadcrumbs", "[class*='breadcrumb']"]:
-        bc = soup.select_one(sel)
-        if bc:
-            items = bc.find_all("li")
-            if len(items) >= 3:
-                text = items[-2].get_text(strip=True)
-                if text and text.lower() not in ("home", "businesses for sale"):
-                    return text
+def save_industries(mapping):
+    with open(INDUSTRY_FILE, "w") as f:
+        json.dump(mapping, f, indent=2, sort_keys=True)
 
-    return "N/A"
+
+def classify_industry(business_name, industry_cache):
+    name_lower = business_name.lower()
+
+    if name_lower in industry_cache:
+        return industry_cache[name_lower]
+
+    for industry, keywords in INDUSTRY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in name_lower:
+                industry_cache[name_lower] = industry
+                return industry
+
+    industry_cache[name_lower] = "Other"
+    return "Other"
 
 
 # --- SDE filtering ---
 
 
 def evaluate_listing(listing):
-    """Returns (include, sde_flag). sde_flag is None when listing should be skipped."""
     cf = listing.get("cash_flow")
     amount = parse_dollar_amount(cf)
 
     if amount is not None:
-        if amount >= MIN_SDE:
-            return True, ""
-        return False, None
-    return True, "NO SDE LISTED"
+        return amount >= MIN_SDE
+    asking = parse_dollar_amount(listing.get("asking_price"))
+    if asking is not None and asking >= 1_000_000:
+        return True
+    return False
 
 
 # --- Google Sheets ---
@@ -310,7 +369,6 @@ def setup_sheets():
                 "Business Name",
                 "Asking Price",
                 "SDE",
-                "SDE Flag",
                 "URL",
                 "Industry",
             ],
@@ -331,9 +389,8 @@ def append_to_sheet(sheet, listings):
                 lst["name"],
                 lst.get("asking_price") or "N/A",
                 lst.get("cash_flow") or "N/A",
-                lst.get("sde_flag", ""),
                 lst["url"],
-                lst.get("industry", "N/A"),
+                lst.get("industry", "Other"),
             ]
         )
     if rows:
@@ -350,7 +407,6 @@ def append_warning_to_sheet(sheet, state_abbr):
             f"⚠️ WARNING: No listings found for {state_abbr} — site may have changed, check script",
             "",
             "",
-            "WARNING",
             "",
             "",
         ],
@@ -367,6 +423,7 @@ def main():
     logger.info("Starting listing monitor run")
 
     seen = load_seen()
+    industry_cache = load_industries()
     all_new = []
     total_checked = 0
 
@@ -423,24 +480,14 @@ def main():
                     if listing["url"] in seen["urls"]:
                         continue
 
-                    include, sde_flag = evaluate_listing(listing)
-
-                    if not include:
+                    if not evaluate_listing(listing):
                         logger.info(
                             f"  - Skipped (SDE < ${MIN_SDE:,}): {listing['name'][:50]}"
                         )
                         seen["urls"].add(listing["url"])
                         continue
 
-                    # Fetch detail page for industry (only for new matching listings)
-                    time.sleep(random.uniform(1, 3))
-                    detail_html = fetch_page(session, listing["url"])
-                    if detail_html:
-                        listing["industry"] = extract_industry(detail_html)
-                    else:
-                        listing["industry"] = "N/A"
-
-                    listing["sde_flag"] = sde_flag
+                    listing["industry"] = classify_industry(listing["name"], industry_cache)
                     listing["date_found"] = datetime.now().strftime("%Y-%m-%d %H:%M")
                     new_for_state.append(listing)
                     seen["urls"].add(listing["url"])
@@ -448,8 +495,8 @@ def main():
                     logger.info(
                         f"  + {listing['name'][:50]} | "
                         f"Price: {listing['asking_price']} | "
-                        f"CF: {listing['cash_flow']} "
-                        f"[{sde_flag or 'OK'}]"
+                        f"CF: {listing['cash_flow']} | "
+                        f"Industry: {listing['industry']}"
                     )
 
                 save_seen(seen)
@@ -482,6 +529,7 @@ def main():
             logger.error(f"Failed to write to sheet: {e}")
 
     save_seen(seen)
+    save_industries(industry_cache)
     logger.info(
         f"Run complete: {total_checked} checked, {len(all_new)} new matches"
     )
