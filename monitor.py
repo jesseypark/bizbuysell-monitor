@@ -38,6 +38,17 @@ BASE_URL = "https://www.businessbroker.net/state/{state}-businesses-for-sale.asp
 MIN_SDE = 300_000
 MAX_PAGES_PER_STATE = 50
 REQUEST_DELAY = (2, 5)
+MAX_ASKING_PRICE = 5_000_000
+
+REJECTED_INDUSTRIES = {
+    "Restaurant", "Fast Food / QSR", "Bar / Brewery",
+    "Plumbing", "Electrical", "Roofing", "HVAC",
+    "Legal", "Medical Practice", "Pharmacy",
+}
+
+SBA_RATE = 0.105
+SBA_TERM_MONTHS = 120
+SBA_LTV = 0.80
 
 GOOGLE_CREDENTIALS_FILE = os.getenv(
     "GOOGLE_CREDENTIALS_FILE", str(SCRIPT_DIR / "credentials.json")
@@ -206,21 +217,27 @@ def _parse_card(card, state_abbr):
             price_text = price_span.get_text(strip=True)
             asking_price = price_text.replace("Asking Price:", "").strip()
 
-    # Cash flow — from listing-financials
+    # Financials — from listing-financials
     cash_flow = None
+    revenue = None
     fin_div = card.find("div", class_="listing-financials")
     if fin_div:
         for fin_item in fin_div.find_all("div", class_="financials"):
             label_span = fin_item.find("span")
-            if label_span and "cash flow" in label_span.get_text(strip=True).lower():
-                full_text = fin_item.get_text(strip=True)
-                cash_flow = full_text.replace(label_span.get_text(strip=True), "").strip()
-                break
+            if not label_span:
+                continue
+            label_text = label_span.get_text(strip=True).lower()
+            value_text = fin_item.get_text(strip=True).replace(label_span.get_text(strip=True), "").strip()
+            if "cash flow" in label_text:
+                cash_flow = value_text
+            elif "revenue" in label_text:
+                revenue = value_text
 
     return {
         "name": name,
         "asking_price": asking_price,
         "cash_flow": cash_flow,
+        "revenue": revenue,
         "url": href,
         "city": city,
         "state": state,
@@ -323,19 +340,252 @@ def classify_industry(business_name, industry_cache):
     return "Other"
 
 
-# --- SDE filtering ---
+# --- Hard filters ---
 
 
-def evaluate_listing(listing):
-    cf = listing.get("cash_flow")
-    amount = parse_dollar_amount(cf)
+def check_hard_filters(listing):
+    """Apply pass/fail filters. Returns (passed, reason)."""
+    industry = listing.get("industry", "Other")
+    if industry in REJECTED_INDUSTRIES:
+        return False, f"rejected industry: {industry}"
 
-    if amount is not None:
-        return amount >= MIN_SDE
+    cf = parse_dollar_amount(listing.get("cash_flow"))
+    revenue = parse_dollar_amount(listing.get("revenue"))
     asking = parse_dollar_amount(listing.get("asking_price"))
-    if asking is not None and asking >= 1_000_000:
-        return True
-    return False
+
+    if cf is not None and cf < MIN_SDE:
+        return False, f"cash flow ${cf:,} < ${MIN_SDE:,}"
+
+    if asking is not None and asking > MAX_ASKING_PRICE:
+        return False, f"asking ${asking:,} > ${MAX_ASKING_PRICE:,}"
+
+    if cf is None and revenue is None:
+        if asking is None or asking < 1_000_000:
+            return False, "missing both revenue and cash flow"
+
+    return True, None
+
+
+# --- Detail page scraping ---
+
+
+def fetch_listing_details(session, url):
+    """Fetch detail page for description, revenue, years, employees."""
+    details = {
+        "description": "",
+        "revenue": None,
+        "years_established": None,
+        "employees": None,
+    }
+
+    html = fetch_page(session, url)
+    if not html:
+        return details
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    desc_div = soup.find("div", class_="listing-description")
+    if not desc_div:
+        desc_div = soup.find("div", id="TextDescription")
+    if not desc_div:
+        for h in soup.find_all(["h2", "h3", "h4"]):
+            if "description" in h.get_text(strip=True).lower():
+                desc_div = h.find_next("div")
+                break
+    if desc_div:
+        details["description"] = desc_div.get_text(separator=" ", strip=True)
+
+    for detail_div in soup.find_all(["div", "li", "tr", "span"]):
+        text = detail_div.get_text(strip=True).lower()
+
+        if "revenue" in text and not details["revenue"]:
+            dollar_match = re.search(r"\$[\d,.]+[kmb]?", detail_div.get_text(strip=True), re.IGNORECASE)
+            if dollar_match:
+                parsed = parse_dollar_amount(dollar_match.group())
+                if parsed and parsed > 0:
+                    details["revenue"] = str(dollar_match.group())
+
+        if ("established" in text or "founded" in text) and not details["years_established"]:
+            year_match = re.search(r"(?:established|since|founded)[:\s]*(\d{4})", text)
+            if year_match:
+                details["years_established"] = datetime.now().year - int(year_match.group(1))
+            else:
+                yr_match = re.search(r"(\d+)\s*(?:year|yr)", text)
+                if yr_match:
+                    details["years_established"] = int(yr_match.group(1))
+
+        if "employee" in text and not details["employees"]:
+            emp_match = re.search(r"(\d+)\s*(?:employee|staff|worker|people)", text)
+            if emp_match:
+                details["employees"] = int(emp_match.group(1))
+
+    return details
+
+
+# --- Listing scoring ---
+
+
+def compute_annual_debt_service(asking_price):
+    loan = asking_price * SBA_LTV
+    r = SBA_RATE / 12
+    n = SBA_TERM_MONTHS
+    monthly = loan * r / (1 - (1 + r) ** (-n))
+    return monthly * 12
+
+
+def score_listing(listing):
+    """Score a listing 0-100. Returns (score, breakdown)."""
+    cf = parse_dollar_amount(listing.get("cash_flow"))
+    asking = parse_dollar_amount(listing.get("asking_price"))
+    revenue = parse_dollar_amount(listing.get("revenue"))
+    years = listing.get("years_established")
+    employees = listing.get("employees")
+    description = (listing.get("description") or "").lower()
+
+    breakdown = {}
+
+    # --- Tier 1: Deal Economics (50 pts max) ---
+
+    sde_mult_pts = 0
+    if cf and asking and cf > 0:
+        multiple = asking / cf
+        if multiple <= 2.5:
+            sde_mult_pts = 20
+        elif multiple <= 3.0:
+            sde_mult_pts = 15
+        elif multiple <= 3.5:
+            sde_mult_pts = 10
+        elif multiple <= 4.0:
+            sde_mult_pts = 5
+        breakdown["multiple"] = round(multiple, 2)
+    breakdown["sde_multiple"] = sde_mult_pts
+
+    dscr_pts = 0
+    if cf and asking and asking > 0:
+        annual_ds = compute_annual_debt_service(asking)
+        dscr = cf / annual_ds if annual_ds > 0 else 0
+        if dscr >= 1.5:
+            dscr_pts = 15
+        elif dscr >= 1.25:
+            dscr_pts = 10
+        elif dscr >= 1.0:
+            dscr_pts = 5
+        breakdown["dscr_value"] = round(dscr, 2)
+    breakdown["dscr"] = dscr_pts
+
+    margin_pts = 0
+    if cf and revenue and revenue > 0:
+        margin = cf / revenue
+        if margin >= 0.30:
+            margin_pts = 15
+        elif margin >= 0.20:
+            margin_pts = 10
+        elif margin >= 0.10:
+            margin_pts = 5
+        breakdown["margin_pct"] = round(margin * 100, 1)
+    breakdown["cf_margin"] = margin_pts
+
+    tier1 = sde_mult_pts + dscr_pts + margin_pts
+
+    # --- Tier 2: Business Quality (30 pts max) ---
+
+    years_pts = 0
+    if years is not None:
+        if years >= 10:
+            years_pts = 10
+        elif years >= 5:
+            years_pts = 7
+        elif years >= 3:
+            years_pts = 4
+        else:
+            years_pts = 1
+    breakdown["years"] = years_pts
+
+    rev_pts = 0
+    if revenue is not None:
+        if 1_000_000 <= revenue <= 5_000_000:
+            rev_pts = 10
+        elif 500_000 <= revenue < 1_000_000:
+            rev_pts = 7
+        elif 5_000_000 < revenue <= 10_000_000:
+            rev_pts = 5
+        elif revenue < 500_000:
+            rev_pts = 2
+    breakdown["revenue_size"] = rev_pts
+
+    emp_pts = 0
+    if employees is not None:
+        if 5 <= employees <= 25:
+            emp_pts = 10
+        elif 25 < employees <= 50:
+            emp_pts = 7
+        elif 1 <= employees <= 4:
+            emp_pts = 4
+        elif employees > 50:
+            emp_pts = 3
+        else:
+            emp_pts = 1
+    breakdown["employees"] = emp_pts
+
+    tier2 = years_pts + rev_pts + emp_pts
+
+    # --- Tier 3: Description Keywords (20 pts max) ---
+
+    keyword_pts = 0
+    signals = []
+
+    if any(kw in description for kw in ["recurring", "contracts", "subscription", "repeat customers", "retention"]):
+        keyword_pts += 8
+        signals.append("+recurring")
+
+    if any(kw in description for kw in ["absentee", "semi-absentee", "manager in place", "management team runs"]):
+        keyword_pts += 5
+        signals.append("+absentee")
+
+    if any(kw in description for kw in ["growing", "growth", "increasing revenue", "year over year"]):
+        keyword_pts += 4
+        signals.append("+growth")
+
+    if any(kw in description for kw in ["real estate included", "property included"]):
+        keyword_pts += 3
+        signals.append("+real_estate")
+
+    if any(kw in description for kw in ["must sell", "motivated seller", "health reasons", "divorce", "urgent"]):
+        keyword_pts -= 5
+        signals.append("-distress")
+
+    if any(kw in description for kw in ["declining", "decreased", "down from", "lost contracts"]):
+        keyword_pts -= 5
+        signals.append("-declining")
+
+    if "franchise" in description:
+        keyword_pts -= 3
+        signals.append("-franchise")
+
+    if any(kw in description for kw in ["large inventory", "inventory not included", "inventory additional"]):
+        keyword_pts -= 2
+        signals.append("-inventory")
+
+    breakdown["signals"] = signals
+    breakdown["keywords"] = keyword_pts
+    tier3 = keyword_pts
+
+    total = max(0, min(100, tier1 + tier2 + tier3))
+    breakdown["tier1"] = tier1
+    breakdown["tier2"] = tier2
+    breakdown["tier3"] = tier3
+
+    return total, breakdown
+
+
+def rank_label(score):
+    if score >= 70:
+        return "A"
+    elif score >= 50:
+        return "B"
+    elif score >= 30:
+        return "C"
+    return "D"
 
 
 # --- Google Sheets ---
@@ -369,8 +619,11 @@ def setup_sheets():
                 "Business Name",
                 "Asking Price",
                 "SDE",
+                "Revenue",
                 "URL",
                 "Industry",
+                "Score",
+                "Rank",
             ],
             value_input_option="USER_ENTERED",
         )
@@ -389,8 +642,11 @@ def append_to_sheet(sheet, listings):
                 lst["name"],
                 lst.get("asking_price") or "N/A",
                 lst.get("cash_flow") or "N/A",
+                lst.get("revenue") or "N/A",
                 lst["url"],
                 lst.get("industry", "Other"),
+                lst.get("score", ""),
+                lst.get("rank", ""),
             ]
         )
     if rows:
@@ -405,6 +661,9 @@ def append_warning_to_sheet(sheet, state_abbr):
             state_abbr,
             "",
             f"⚠️ WARNING: No listings found for {state_abbr} — site may have changed, check script",
+            "",
+            "",
+            "",
             "",
             "",
             "",
@@ -480,14 +739,26 @@ def main():
                     if listing["url"] in seen["urls"]:
                         continue
 
-                    if not evaluate_listing(listing):
-                        logger.info(
-                            f"  - Skipped (SDE < ${MIN_SDE:,}): {listing['name'][:50]}"
-                        )
+                    listing["industry"] = classify_industry(listing["name"], industry_cache)
+
+                    passed, reason = check_hard_filters(listing)
+                    if not passed:
+                        logger.info(f"  - Filtered ({reason}): {listing['name'][:50]}")
                         seen["urls"].add(listing["url"])
                         continue
 
-                    listing["industry"] = classify_industry(listing["name"], industry_cache)
+                    time.sleep(random.uniform(*REQUEST_DELAY))
+                    details = fetch_listing_details(session, listing["url"])
+                    listing["description"] = details.get("description", "")
+                    listing["years_established"] = details.get("years_established")
+                    listing["employees"] = details.get("employees")
+                    if not listing.get("revenue") and details.get("revenue"):
+                        listing["revenue"] = details["revenue"]
+
+                    score, breakdown = score_listing(listing)
+                    listing["score"] = score
+                    listing["rank"] = rank_label(score)
+
                     listing["date_found"] = datetime.now().strftime("%Y-%m-%d %H:%M")
                     new_for_state.append(listing)
                     seen["urls"].add(listing["url"])
@@ -496,7 +767,8 @@ def main():
                         f"  + {listing['name'][:50]} | "
                         f"Price: {listing['asking_price']} | "
                         f"CF: {listing['cash_flow']} | "
-                        f"Industry: {listing['industry']}"
+                        f"{listing['industry']} | "
+                        f"Score: {score} ({listing['rank']})"
                     )
 
                 save_seen(seen)
